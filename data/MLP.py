@@ -5,125 +5,41 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
-import random
+import sys
+from data import ThreeBodyDataset
 
-def simulate_3body(num_steps=500, dt=0.01, min_distance=0.1):
-    def grav_force(pos_i, pos_j, mass_j):
-        r = pos_j - pos_i
-        dist = torch.norm(r) + 1e-5
-        return r * mass_j / (dist**3)
-
-    positions = torch.rand(3, 2) * 2 - 1 
-    velocities = torch.randn(3, 2) * 0.1
-    masses = torch.tensor([1.0, 1.0, 1.0])
-    trajectory = []
-
-    for _ in range(num_steps):
-        forces = torch.zeros(3, 2)
-        for i in range(3):
-            for j in range(3):
-                if i != j:
-                    dist = torch.norm(positions[i] - positions[j])
-                    if dist < min_distance:
-                        
-                        direction = (positions[i] - positions[j])
-                        forces[i] += direction / (dist**2 + 1e-5)
-                    else:
-                        forces[i] += grav_force(positions[i], positions[j], masses[j])
-        accelerations = forces / masses.unsqueeze(1)
-        velocities += accelerations * dt
-        positions += velocities * dt
-        state = torch.cat([positions.flatten(), velocities.flatten()])
-        trajectory.append(state.unsqueeze(0))
-
-    trajectory = torch.cat(trajectory, dim=0).unsqueeze(0) 
-    return trajectory.numpy()
-
-# Save to disk
-data = simulate_3body()
-np.savez("threebody_single.npz", data=data)
-
-class NBodyTrajectoryDataset(Dataset):
-    def __init__(self, filepath: str, rollout: int = 1, normalization_strategy: str = 'per_simulation'):
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f"Data file not found at {filepath}")
-        if rollout < 1:
-            raise ValueError("Rollout must be at least 1.")
-
-        with np.load(filepath) as f:
-            self.raw_data = f["data"].astype(np.float32)
-
-        self.rollout = rollout
-        self.num_simulations, self.timesteps, self.num_features = self.raw_data.shape
-
-        self.normalization_strategy = normalization_strategy
-        self._setup_normalization()
-
-        self.num_samples_per_sim = self.timesteps - self.rollout
-        self.total_samples = self.num_simulations * self.num_samples_per_sim
-
-    def _setup_normalization(self):
-        if self.normalization_strategy == 'global':
-            self.data_min = np.min(self.raw_data, axis=(0, 1), keepdims=True)
-            self.data_max = np.max(self.raw_data, axis=(0, 1), keepdims=True)
-        elif self.normalization_strategy == 'per_simulation':
-            self.data_min = np.min(self.raw_data, axis=1, keepdims=True)
-            self.data_max = np.max(self.raw_data, axis=1, keepdims=True)
-        else:
-            self.data_min = self.data_max = None
-
-    def normalize(self, data: np.ndarray, sim_idx: int) -> np.ndarray:
-        if self.data_min is None:
-            return data
-        min_vals = self.data_min if self.normalization_strategy == 'global' else self.data_min[sim_idx]
-        max_vals = self.data_max if self.normalization_strategy == 'global' else self.data_max[sim_idx]
-        return (data - min_vals) / (max_vals - min_vals + 1e-8)
-
-    def unnormalize(self, normalized_data: torch.Tensor, sim_idx: int) -> torch.Tensor:
-        if self.data_min is None:
-            return normalized_data
-        min_vals = torch.tensor(self.data_min[sim_idx], device=normalized_data.device)
-        max_vals = torch.tensor(self.data_max[sim_idx], device=normalized_data.device)
-        return normalized_data * (max_vals - min_vals + 1e-8) + min_vals
-
-    def __len__(self) -> int:
-        return self.total_samples
-
-    def __getitem__(self, idx: int):
-        sim_idx = idx // self.num_samples_per_sim
-        time_idx = idx % self.num_samples_per_sim
-        x_raw = self.raw_data[sim_idx, time_idx]
-        y_raw = self.raw_data[sim_idx, time_idx + self.rollout]
-        x = torch.from_numpy(self.normalize(x_raw, sim_idx))
-        y = torch.from_numpy(self.normalize(y_raw, sim_idx))
-        return x, y, sim_idx
-
-dataset = NBodyTrajectoryDataset("threebody_single.npz", rollout=1)
-loader = DataLoader(dataset, batch_size=1, shuffle=True)
-
-class SimpleMLP(nn.Module):
-    def __init__(self, width, in_features):
+# MLP
+class MLP(nn.Module):
+    """
+    A simple Multi-Layer Perceptron for predicting the next state
+    of a 3-body system.
+    """
+    def __init__(self, input_features, output_features, hidden_size=256):
+        """
+        Args:
+            input_features (int): Total number of features in the input (e.g., history_frames * 12).
+            output_features (int): Number of features in the output (e.g., 12).
+            hidden_size (int): Size of the hidden layers.
+        """
         super().__init__()
-        self.width = width
-        self.fc0 = nn.Linear(in_features, width)
+        self.fc0 = nn.Linear(input_features, hidden_size)
         
         self.mlp1 = nn.Sequential(
-            nn.Linear(width, width),
+            nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(width, width)
+            nn.Linear(hidden_size, hidden_size)
         )
+        self.w1 = nn.Linear(hidden_size, hidden_size) 
         
         self.mlp2 = nn.Sequential(
-            nn.Linear(width, width),
+            nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(width, width)
+            nn.Linear(hidden_size, hidden_size)
         )
-        
-        self.w1 = nn.Linear(width, width)
-        self.w2 = nn.Linear(width, width)
-        
-        self.fc1 = nn.Linear(width, 128)
-        self.fc2 = nn.Linear(128, in_features)
+        self.w2 = nn.Linear(hidden_size, hidden_size) 
+
+        self.fc1 = nn.Linear(hidden_size, 128)
+        self.fc2 = nn.Linear(128, output_features) 
         
         self.dropout = nn.Dropout(0.1)
 
@@ -132,9 +48,9 @@ class SimpleMLP(nn.Module):
         
         if x.dim() == 1:
             x = x.unsqueeze(0)
+            
+        x = F.relu(self.fc0(x))
         
-        x = self.fc0(x)
-    
         x1 = self.mlp1(x)
         x2 = self.w1(x)
         x = F.relu(x1 + x2)
@@ -145,44 +61,58 @@ class SimpleMLP(nn.Module):
         x = F.relu(x1 + x2)
         x = self.dropout(x)
         
-        x = self.fc1(x)
-        x = F.relu(x)
+        x = F.relu(self.fc1(x))
         x = self.fc2(x)
         
         if len(original_shape) == 1:
             x = x.squeeze(0)
-        
+            
         return x
 
+# Training
+
+HISTORY_FRAMES = 2 
+BATCH_SIZE = 64   
+NUM_EPOCHS = 500   
+LEARNING_RATE = 1e-3
+
+MODEL_NAME = "MLP"
+CHECKPOINT_PATH = f"{MODEL_NAME.lower()}_3body_checkpoint.pth"
+FINAL_MODEL_PATH = f"{MODEL_NAME.lower()}_3body_final.pth"
+LOSS_PLOT_PATH = f"{MODEL_NAME.lower()}_training_loss.png"
+EVAL_PLOT_PATH = f"{MODEL_NAME.lower()}_evaluation_plot.png"
+
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Training on device: {device}")
+print(f"Training {MODEL_NAME} on device: {device}")
 
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
-    print(f"Initial GPU Memory Allocated: {torch.cuda.memory_allocated(0) / 1024**2:.1f} MB")
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.enabled = True
 else:
     print("CUDA not available, using CPU")
 
-use_amp = torch.cuda.is_available() and hasattr(torch.cuda, 'amp')
-if use_amp:
-    from torch.cuda.amp import autocast, GradScaler
-    scaler = GradScaler()
-    print("Using mixed precision training (AMP)")
+dataset = ThreeBodyDataset(filename="three_body_data.pt", history_frames=HISTORY_FRAMES)
+loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-model = SimpleMLP(width=64, in_features=12).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+INPUT_FEATURES = HISTORY_FRAMES * 12
+OUTPUT_FEATURES = 12
+
+model = MLP(input_features=INPUT_FEATURES, output_features=OUTPUT_FEATURES, hidden_size=256).to(device)
+
+print(f"Model {MODEL_NAME} initialized with {sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable parameters.")
+
+
+optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 loss_fn = nn.MSELoss()
-checkpoint_path = "mlp_3body.pth"
+
 start_epoch = 0
 loss_history = []
 best_loss = float('inf')
 
-if os.path.exists(checkpoint_path):
+if os.path.exists(CHECKPOINT_PATH):
     try:
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
         
         if "model_state_dict" in checkpoint:
             model.load_state_dict(checkpoint["model_state_dict"])
@@ -190,50 +120,43 @@ if os.path.exists(checkpoint_path):
             start_epoch = checkpoint["epoch"] + 1
             loss_history = checkpoint.get("loss_history", [])
             best_loss = checkpoint.get("best_loss", float('inf'))
-            print(f"Resumed from checkpoint at epoch {start_epoch}")
+            print(f"Resumed {MODEL_NAME} from checkpoint at epoch {start_epoch}, Best Loss: {best_loss:.6f}")
         else:
             print("Checkpoint format is incompatible. Starting fresh training.")
-            os.remove(checkpoint_path)
+            os.remove(CHECKPOINT_PATH)
     except Exception as e:
-        print(f"Error loading checkpoint: {e}")
+        print(f"Error loading checkpoint for {MODEL_NAME}: {e}")
         print("Starting fresh training.")
-        if os.path.exists(checkpoint_path):
-            os.remove(checkpoint_path)
+        if os.path.exists(CHECKPOINT_PATH):
+            os.remove(CHECKPOINT_PATH)
 
 model.train()
-for epoch in range(start_epoch, 500):
+print(f"\nStarting {MODEL_NAME} training...")
+for epoch in range(start_epoch, NUM_EPOCHS):
     total_loss = 0
     num_batches = 0
     
-    for x, y, sim_idx in loader:
+    for x, y in loader:
         x, y = x.to(device), y.to(device)
-        optimizer.zero_grad()
         
-        if use_amp:
-            with autocast():
-                pred = model(x)
-                loss = loss_fn(pred, y)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            pred = model(x)
-            loss = loss_fn(pred, y)
-            loss.backward()
-            optimizer.step()
-            
+        pred = model(x)
+        loss = loss_fn(pred, y)
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
         total_loss += loss.item()
         num_batches += 1
 
     avg_loss = total_loss / num_batches
     loss_history.append(avg_loss)
     
-    # Track best loss
     if avg_loss < best_loss:
         best_loss = avg_loss
     
-    if epoch % 50 == 0:
-        print(f"Epoch {epoch} | Loss: {avg_loss:.6f} | Best: {best_loss:.6f}")
+    if epoch % 50 == 0 or epoch == NUM_EPOCHS - 1:
+        print(f"Epoch {epoch} | Loss: {avg_loss:.6f} | Best Loss: {best_loss:.6f}")
         
         if torch.cuda.is_available():
             print(f"GPU Memory Used: {torch.cuda.memory_allocated(0) / 1024**2:.1f} MB")
@@ -244,47 +167,28 @@ for epoch in range(start_epoch, 500):
             "epoch": epoch,
             "loss_history": loss_history,
             "best_loss": best_loss
-        }, checkpoint_path)
+        }, CHECKPOINT_PATH)
+        print(f"Checkpoint saved to {CHECKPOINT_PATH}")
+
+print(f"\n{MODEL_NAME} training completed. Final loss: {loss_history[-1]:.6f}, Best loss: {best_loss:.6f}")
 
 torch.save({
     "model_state_dict": model.state_dict(),
     "optimizer_state_dict": optimizer.state_dict(),
-    "epoch": 500,
+    "epoch": NUM_EPOCHS,
     "loss_history": loss_history,
     "best_loss": best_loss
-}, "mlp_3body_final.pth")
-
-print(f"Training completed. Final loss: {loss_history[-1]:.6f}, Best loss: {best_loss:.6f}")
+}, FINAL_MODEL_PATH)
+print(f"Final {MODEL_NAME} model saved to {FINAL_MODEL_PATH}")
 
 plt.figure(figsize=(10, 6))
 plt.plot(loss_history, 'b-', linewidth=2)
-plt.title("MLP Training Loss Over Epochs")
+plt.title(f"{MODEL_NAME} Training Loss Over Epochs")
 plt.xlabel("Epoch")
 plt.ylabel("Loss")
 plt.grid(True, alpha=0.3)
-plt.yscale('log') 
+plt.yscale('log')
 plt.tight_layout()
-plt.savefig('mlp_training_loss.png', dpi=300, bbox_inches='tight')
+plt.savefig(LOSS_PLOT_PATH, dpi=300, bbox_inches='tight')
 plt.show()
-
-model.eval()
-x, y, sim_idx = dataset[0]
-x = x.to(device)
-with torch.no_grad():
-    pred = model(x)
-
-gt = dataset.unnormalize(y, sim_idx)
-out = dataset.unnormalize(pred.cpu(), sim_idx)
-
-fig, axs = plt.subplots(3, 1, figsize=(10, 6), sharex=True)
-axs[0].plot(gt.numpy(), label="Ground Truth")
-axs[0].legend(); axs[0].set_title("Ground Truth")
-
-axs[1].plot(out.numpy(), label="Prediction")
-axs[1].legend(); axs[1].set_title("MLP Prediction")
-
-axs[2].plot((gt - out).numpy(), label="Error")
-axs[2].legend(); axs[2].set_title("Prediction Error")
-
-plt.tight_layout()
-plt.show()
+print(f"Training loss plot saved to {LOSS_PLOT_PATH}")
