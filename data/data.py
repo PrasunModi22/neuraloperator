@@ -1,126 +1,124 @@
-import torch
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
 import os
+import torch
+import torch.nn as nn 
+import torch.nn.functional as F 
+from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+import sys
 
-# ===== Three-body simulation =====
 def generate_simulation(num_steps=500, dt=0.01, G=1.0, min_distance=0.1):
-    """
-    Generates a single 3-body simulation trajectory.
-    Includes collision avoidance (repulsion) when bodies get too close.
+    pos = np.random.randn(3, 2) * 2 - 1
+    vel = np.random.randn(3, 2) * 0.1
+    masses = np.random.uniform(0.5, 1.5, size=3)
 
-    Returns:
-        np.ndarray: A trajectory of shape [num_steps, 12], where 12
-                    represents (pos_x, pos_y, vel_x, vel_y) for 3 bodies.
-    """
-    # Initial random positions and velocities
-    pos = np.random.randn(3, 2) * 2 - 1 # 3 bodies in 2D, more spread out
-    vel = np.random.randn(3, 2) * 0.1   # Small random velocities
-    masses = np.random.uniform(0.5, 1.5, size=3) # Varying masses
+    trajectory = []
 
-    trajectory = [] # Stores flattened state [p1x,p1y,v1x,v1y, p2x,p2y,v2x,v2y, p3x,p3y,v3x,v3y]
+    acc = np.zeros((3, 2))
+    for i in range(3):
+        for j in range(3):
+            if i != j:
+                r_vec = pos[j] - pos[i]
+                dist = np.linalg.norm(r_vec)
+                if dist < min_distance:
+                    direction = (pos[i] - pos[j])
+                    acc[i] += direction / (dist**2 + 1e-5) * G * 100
+                else:
+                    acc[i] += G * masses[j] * r_vec / (dist**3 + 1e-5)
+    acc /= masses[:, np.newaxis] 
 
-    for _ in range(num_steps):
-        # Store the current flattened state
+    for step in range(num_steps):
         current_state = np.concatenate([pos.flatten(), vel.flatten()])
         trajectory.append(current_state)
 
-        acc = np.zeros((3, 2))
+        vel += acc * (dt / 2)
+
+        pos += vel * dt
+
+        new_acc = np.zeros((3, 2))
         for i in range(3):
             for j in range(3):
                 if i != j:
                     r_vec = pos[j] - pos[i]
                     dist = np.linalg.norm(r_vec)
-                    
-                    # Apply strong repulsion if too close to prevent division by zero and extreme forces
                     if dist < min_distance:
-                        direction = (pos[i] - pos[j]) # Repel away from each other
-                        # Scale repulsion inversely to distance squared, with a large constant
-                        acc[i] += direction / (dist**2 + 1e-5) * G * 100 
+                        direction = (pos[i] - pos[j])
+                        new_acc[i] += direction / (dist**2 + 1e-5) * G * 100
                     else:
-                        # Gravitational force
-                        acc[i] += G * masses[j] * r_vec / (dist**3 + 1e-5) # Add small epsilon for stability
+                        new_acc[i] += G * masses[j] * r_vec / (dist**3 + 1e-5)
+        new_acc /= masses[:, np.newaxis]
 
-        vel += acc * dt
-        pos += vel * dt
+        vel += new_acc * (dt / 2)
+        
+        acc = new_acc 
 
-    return np.array(trajectory).astype(np.float32)
+    return np.array(trajectory).astype(np.float32), masses.astype(np.float32)
 
-# ===== Save multiple simulations =====
 def generate_and_save_data(num_sims=1000, num_steps=500, filename="three_body_data.pt"):
-    """
-    Generates multiple 3-body simulations and saves them to a PyTorch tensor file.
-
-    Args:
-        num_sims (int): Number of simulations to generate.
-        num_steps (int): Number of time steps per simulation.
-        filename (str): Name of the file to save the data.
-    """
     print(f"Generating {num_sims} simulations, each with {num_steps} steps...")
-    all_simulations = []
+    all_trajectories = []
+    all_masses = []
     for i in range(num_sims):
-        sim_data = generate_simulation(num_steps=num_steps)
-        all_simulations.append(sim_data)
+        sim_data, sim_masses = generate_simulation(num_steps=num_steps)
+        all_trajectories.append(sim_data)
+        all_masses.append(sim_masses)
         if (i + 1) % 100 == 0:
             print(f"Generated {i+1}/{num_sims} simulations.")
 
-    # Stack all simulations: [num_sims, num_steps, 12]
-    tensor_data = torch.tensor(np.stack(all_simulations), dtype=torch.float32)
-    torch.save(tensor_data, filename)
-    print(f"All simulations saved to {filename} with shape: {tensor_data.shape}")
+    tensor_data = torch.tensor(np.stack(all_trajectories), dtype=torch.float32)
+    mass_data = torch.tensor(np.stack(all_masses), dtype=torch.float32)
 
-# ===== Dataset class =====
+    torch.save({'data': tensor_data, 'masses': mass_data}, filename)
+    print(f"All simulations saved to {filename} with data shape: {tensor_data.shape}, masses shape: {mass_data.shape}")
+
+# Dataset
 class ThreeBodyDataset(Dataset):
-    """
-    PyTorch Dataset for 3-body simulation data.
-    Uses the first simulation slice and provides input with a history of frames.
-    Normalizes the entire dataset upon initialization.
-    """
     def __init__(self, filename="three_body_data.pt", history_frames=2):
-        """
-        Args:
-            filename (str): Path to the saved simulation data file.
-            history_frames (int): Number of past frames (including current) to use as input.
-                                  e.g., 2 means input is [t-1, t], target is [t+1].
-        """
+
         if not os.path.exists(filename):
-            raise FileNotFoundError(f"Data file not found at {filename}. Please run data.py to generate it.")
+            print(f"Data file '{filename}' not found. Generating data...")
+            generate_and_save_data(filename=filename)
 
         self.history_frames = history_frames
-        # Load all data, shape: [num_sims, T, 12]
-        self.raw_data = torch.load(filename) 
+        
+        loaded_content = torch.load(filename) 
 
-        # Use only the first simulation as requested, shape: [T, 12]
-        self.single_simulation = self.raw_data[0] 
+        if not isinstance(loaded_content, dict) or 'data' not in loaded_content or 'masses' not in loaded_content:
+            error_msg = (
+                f"Error: Data file '{filename}' is not in the expected dictionary format. "
+                "It should contain 'data' and 'masses' keys. "
+                "This often happens if an older script saved the file differently.\n"
+                "Please delete the existing 'three_body_data.pt' file and re-run this script "
+                "to generate the data in the correct format."
+            )
+            raise ValueError(error_msg)
+
+        self.raw_data = loaded_content['data'] 
+        self.raw_masses = loaded_content['masses'] 
+
+        self.single_simulation_trajectory = self.raw_data[0] 
+        self.single_simulation_masses = self.raw_masses[0] 
 
         self.inputs = []
         self.targets = []
 
-        # Prepare (input_sequence, target_frame) pairs
-        # Input sequence: frames from (t - history_frames + 1) to t
-        # Target: frame at t + 1
-        # Loop starts from `history_frames - 1` to ensure enough preceding frames for input
-        # Loop ends at `len(self.single_simulation) - 1` because the target is `t + 1`
-        for t in range(self.history_frames - 1, len(self.single_simulation) - 1):
-            input_sequence = self.single_simulation[t - self.history_frames + 1 : t + 1]
-            self.inputs.append(input_sequence.reshape(-1)) # Flatten to [history_frames * 12]
+        for t in range(self.history_frames - 1, len(self.single_simulation_trajectory) - 1):
+            input_sequence = self.single_simulation_trajectory[t - self.history_frames + 1 : t + 1]
+            self.inputs.append(input_sequence.reshape(-1)) 
 
-            target_frame = self.single_simulation[t + 1]
-            self.targets.append(target_frame.reshape(-1)) # Flatten to [12]
-
-        self.inputs = torch.stack(self.inputs)   # Shape: [num_samples, history_frames * 12]
-        self.targets = torch.stack(self.targets) # Shape: [num_samples, 12]
+            target_frame = self.single_simulation_trajectory[t + 1]
+            self.targets.append(target_frame.reshape(-1)) 
+        self.inputs = torch.stack(self.inputs) 
+        self.targets = torch.stack(self.targets) 
 
         print(f"Dataset created from first simulation. Input shape: {self.inputs.shape}, Target shape: {self.targets.shape}")
 
-        # Normalize the entire dataset during initialization
         self._normalize_data()
 
     def _normalize_data(self):
         """Calculates and applies normalization (mean/std) to the entire dataset."""
-        # Calculate mean and std across all samples and features
         self.input_mean = self.inputs.mean(dim=0, keepdim=True)
-        self.input_std = self.inputs.std(dim=0, keepdim=True) + 1e-8 # Add epsilon for stability
+        self.input_std = self.inputs.std(dim=0, keepdim=True) + 1e-8 
         
         self.target_mean = self.targets.mean(dim=0, keepdim=True)
         self.target_std = self.targets.std(dim=0, keepdim=True) + 1e-8
@@ -130,32 +128,102 @@ class ThreeBodyDataset(Dataset):
         print("Dataset normalized.")
 
     def unnormalize_output(self, normalized_output: torch.Tensor) -> torch.Tensor:
-        """Unnormalizes a model's output using the target's mean and std."""
         return normalized_output * self.target_std + self.target_mean
+
+    def unnormalize_input(self, normalized_input: torch.Tensor) -> torch.Tensor:
+        return normalized_input * self.input_std + self.input_mean
 
     def __len__(self):
         return len(self.inputs)
 
     def __getitem__(self, idx):
-        return self.inputs[idx], self.targets[idx]
+        return self.inputs[idx], self.targets[idx], self.single_simulation_masses
 
-# ===== Run this script directly to generate data =====
+# Visualization
+def plot_3body_state(ax, state_vector_np, masses_np, title="", colors=['r', 'g', 'b'], 
+                     vel_arrow_color='k', grav_arrow_color='purple', arrow_scale=0.5, alpha=0.8, G=1.0):
+    states = state_vector_np.reshape(3, 4)
+    positions = states[:, :2]
+    velocities = states[:, 2:] 
+
+    forces = np.zeros((3, 2))
+    for i in range(3):
+        for j in range(3):
+            if i != j:
+                r_vec = positions[j] - positions[i]
+                dist = np.linalg.norm(r_vec)
+                
+                force_magnitude = (G * masses_np[j] * masses_np[i]) / (dist**2 + 1e-5)
+                force_direction = r_vec / (dist + 1e-5)
+                forces[i] += force_direction * force_magnitude
+
+    for i in range(3):
+        px, py = positions[i]
+        vx, vy = velocities[i]
+        fx, fy = forces[i]
+        color = colors[i]
+        
+        ax.plot(px, py, 'o', color=color, markersize=8, alpha=alpha, label=f'Body {i+1}')
+        
+        ax.quiver(px, py, vx, vy, color=vel_arrow_color, scale=1, scale_units='xy', 
+                  angles='xy', width=0.005, headwidth=3, headlength=5, alpha=alpha)
+        
+        force_norm = np.linalg.norm(forces[i])
+        if force_norm > 1e-6: 
+            fx_norm, fy_norm = fx / force_norm, fy / force_norm
+        else:
+            fx_norm, fy_norm = 0, 0
+        
+        ax.quiver(px, py, fx_norm, fy_norm, color=grav_arrow_color, scale=1, scale_units='xy', 
+                  angles='xy', width=0.005, headwidth=3, headlength=5, alpha=alpha)
+        
+    ax.set_aspect('equal', adjustable='box')
+    ax.set_xlim([-3, 3]) 
+    ax.set_ylim([-3, 3])
+    ax.set_title(title)
+    ax.grid(True, linestyle='--', alpha=0.5)
+
 if __name__ == "__main__":
-    # Generate 1000 simulations, each with 500 steps
-    generate_and_save_data(num_sims=1000, num_steps=500)
-    
-    # Test the dataset loading and structure
+    HISTORY_FRAMES = 2 
+    DATA_FILENAME = "three_body_data.pt"
+    VIS_PLOT_PATH = "dataset_visualization.png" 
+
     try:
-        # history_frames=2 means input will be 2 * 12 = 24 features
-        dataset = ThreeBodyDataset(history_frames=2) 
-        loader = DataLoader(dataset, batch_size=4, shuffle=True)
-        print("\nTesting dataset batches:")
-        for i, (x, y) in enumerate(loader):
-            print(f"Batch {i}: Input shape={x.shape}, Target shape={y.shape}")
-            if i > 2: # Print a few batches to verify
-                break
-    except FileNotFoundError as e:
+        dataset = ThreeBodyDataset(filename=DATA_FILENAME, history_frames=HISTORY_FRAMES)
+    except ValueError as e:
         print(e)
-    except Exception as e:
-        print(f"An error occurred during dataset test: {e}")
+        sys.exit(1) 
+    
+    print("\nStarting dataset visualization...")
+    x_sample_norm, y_sample_norm, masses_sample = dataset[0] 
+
+    current_state_t_norm = x_sample_norm[-12:] 
+    current_state_t_unnorm = dataset.unnormalize_output(current_state_t_norm.cpu()).numpy()
+
+    gt_next_state_unnorm = dataset.unnormalize_output(y_sample_norm.cpu()).numpy()
+
+    fig_vis, axs_vis = plt.subplots(1, 2, figsize=(12, 6), sharex=True, sharey=True)
+    fig_vis.suptitle("3-Body Dataset Visualization (Sample 0)", fontsize=16)
+
+    plot_3body_state(axs_vis[0], current_state_t_unnorm, masses_sample.numpy(), 
+                     title="Current State (Time t)", vel_arrow_color='k', grav_arrow_color='purple')
+
+    plot_3body_state(axs_vis[1], gt_next_state_unnorm, masses_sample.numpy(), 
+                     title="Ground Truth Next State (Time t+1)", vel_arrow_color='k', grav_arrow_color='purple')
+
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], marker='o', color='r', label='Body 1 Position', markersize=8),
+        Line2D([0], [0], marker='o', color='g', label='Body 2 Position', markersize=8),
+        Line2D([0], [0], marker='o', color='b', label='Body 3 Position', markersize=8),
+        Line2D([0], [0], color='k', lw=2, label='Velocity Vector'),
+        Line2D([0], [0], color='purple', lw=2, label='Grav. Force Vector')
+    ]
+    fig_vis.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(1.0, 0.95))
+
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) 
+    plt.savefig(VIS_PLOT_PATH, dpi=300, bbox_inches='tight')
+    plt.show()
+    print(f"Dataset visualization plot saved to {VIS_PLOT_PATH}")
 
