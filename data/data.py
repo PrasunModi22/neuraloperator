@@ -1,19 +1,23 @@
 import numpy as np
 import os
 import torch
-import torch.nn as nn 
-import torch.nn.functional as F 
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 import sys
+from matplotlib.lines import Line2D
 
 def generate_simulation(num_steps=500, dt=0.01, G=1.0, min_distance=0.1):
+    """
+    Generates a single 3-body simulation trajectory using a more accurate
+    velocity Verlet integration scheme.
+    """
     pos = np.random.randn(3, 2) * 2 - 1
     vel = np.random.randn(3, 2) * 0.1
     masses = np.random.uniform(0.5, 1.5, size=3)
 
     trajectory = []
 
+    # Calculate initial acceleration
     acc = np.zeros((3, 2))
     for i in range(3):
         for j in range(3):
@@ -27,14 +31,18 @@ def generate_simulation(num_steps=500, dt=0.01, G=1.0, min_distance=0.1):
                     acc[i] += G * masses[j] * r_vec / (dist**3 + 1e-5)
     acc /= masses[:, np.newaxis] 
 
-    for step in range(num_steps):
+    for _ in range(num_steps):
+        # Save the current state before updating
         current_state = np.concatenate([pos.flatten(), vel.flatten()])
         trajectory.append(current_state)
 
+        # Update velocity (half step)
         vel += acc * (dt / 2)
 
+        # Update position
         pos += vel * dt
 
+        # Calculate new acceleration
         new_acc = np.zeros((3, 2))
         for i in range(3):
             for j in range(3):
@@ -48,13 +56,16 @@ def generate_simulation(num_steps=500, dt=0.01, G=1.0, min_distance=0.1):
                         new_acc[i] += G * masses[j] * r_vec / (dist**3 + 1e-5)
         new_acc /= masses[:, np.newaxis]
 
+        # Update velocity (full step)
         vel += new_acc * (dt / 2)
         
+        # Update acceleration for the next step
         acc = new_acc 
 
     return np.array(trajectory).astype(np.float32), masses.astype(np.float32)
 
 def generate_and_save_data(num_sims=1000, num_steps=500, filename="three_body_data.pt"):
+    """Generates multiple 3-body simulations and saves them to a PyTorch tensor file."""
     print(f"Generating {num_sims} simulations, each with {num_steps} steps...")
     all_trajectories = []
     all_masses = []
@@ -71,10 +82,12 @@ def generate_and_save_data(num_sims=1000, num_steps=500, filename="three_body_da
     torch.save({'data': tensor_data, 'masses': mass_data}, filename)
     print(f"All simulations saved to {filename} with data shape: {tensor_data.shape}, masses shape: {mass_data.shape}")
 
-# Dataset
 class ThreeBodyDataset(Dataset):
-    def __init__(self, filename="three_body_data.pt", history_frames=2):
-
+    """
+    PyTorch Dataset for 3-body simulation data.
+    This version implements a single, global normalization across the entire dataset.
+    """
+    def __init__(self, filename="three_body_data.pt", history_frames=2, num_sims_to_use=10):
         if not os.path.exists(filename):
             print(f"Data file '{filename}' not found. Generating data...")
             generate_and_save_data(filename=filename)
@@ -82,66 +95,74 @@ class ThreeBodyDataset(Dataset):
         self.history_frames = history_frames
         
         loaded_content = torch.load(filename) 
-
         if not isinstance(loaded_content, dict) or 'data' not in loaded_content or 'masses' not in loaded_content:
             error_msg = (
                 f"Error: Data file '{filename}' is not in the expected dictionary format. "
                 "It should contain 'data' and 'masses' keys. "
-                "This often happens if an older script saved the file differently.\n"
-                "Please delete the existing 'three_body_data.pt' file and re-run this script "
-                "to generate the data in the correct format."
             )
             raise ValueError(error_msg)
 
-        self.raw_data = loaded_content['data'] 
-        self.raw_masses = loaded_content['masses'] 
+        # Use only the specified number of simulations
+        self.raw_data = loaded_content['data'][:num_sims_to_use]
+        self.raw_masses = loaded_content['masses'][:num_sims_to_use]
+        print(f"Using the first {num_sims_to_use} simulations for training.")
 
-        self.single_simulation_trajectory = self.raw_data[0] 
-        self.single_simulation_masses = self.raw_masses[0] 
+        # --- CORRECTED GLOBAL NORMALIZATION ---
+        self._normalize_data()
 
         self.inputs = []
         self.targets = []
+        self.sample_masses = []
 
-        for t in range(self.history_frames - 1, len(self.single_simulation_trajectory) - 1):
-            input_sequence = self.single_simulation_trajectory[t - self.history_frames + 1 : t + 1]
-            self.inputs.append(input_sequence.reshape(-1)) 
+        # Create input/target pairs from the normalized data
+        for sim_idx in range(len(self.normalized_data)):
+            sim_data = self.normalized_data[sim_idx]
+            sim_masses = self.raw_masses[sim_idx]
+            for t in range(self.history_frames - 1, len(sim_data) - 1):
+                input_sequence = sim_data[t - self.history_frames + 1 : t + 1]
+                self.inputs.append(input_sequence.reshape(-1))
 
-            target_frame = self.single_simulation_trajectory[t + 1]
-            self.targets.append(target_frame.reshape(-1)) 
+                target_frame = sim_data[t + 1]
+                self.targets.append(target_frame.reshape(-1))
+                
+                self.sample_masses.append(sim_masses)
+
         self.inputs = torch.stack(self.inputs) 
         self.targets = torch.stack(self.targets) 
+        self.sample_masses = torch.stack(self.sample_masses)
 
-        print(f"Dataset created from first simulation. Input shape: {self.inputs.shape}, Target shape: {self.targets.shape}")
-
-        self._normalize_data()
+        print(f"Dataset created. Input shape: {self.inputs.shape}, Target shape: {self.targets.shape}")
 
     def _normalize_data(self):
         """Calculates and applies normalization (mean/std) to the entire dataset."""
-        self.input_mean = self.inputs.mean(dim=0, keepdim=True)
-        self.input_std = self.inputs.std(dim=0, keepdim=True) + 1e-8 
+        # Flatten all simulation data to a single tensor for consistent mean/std calculation
+        flat_data = self.raw_data.view(-1, 12)
         
-        self.target_mean = self.targets.mean(dim=0, keepdim=True)
-        self.target_std = self.targets.std(dim=0, keepdim=True) + 1e-8
+        # Calculate mean and std for each of the 12 features (pos and vel for 3 bodies)
+        self.data_mean = flat_data.mean(dim=0, keepdim=True)
+        self.data_std = flat_data.std(dim=0, keepdim=True) + 1e-8 # Add epsilon for stability
+        
+        # Apply normalization to all raw data
+        self.normalized_data = (self.raw_data - self.data_mean) / self.data_std
+        print("Entire dataset normalized with consistent mean/std.")
 
-        self.inputs = (self.inputs - self.input_mean) / self.input_std
-        self.targets = (self.targets - self.target_mean) / self.target_std
-        print("Dataset normalized.")
-
-    def unnormalize_output(self, normalized_output: torch.Tensor) -> torch.Tensor:
-        return normalized_output * self.target_std + self.target_mean
-
-    def unnormalize_input(self, normalized_input: torch.Tensor) -> torch.Tensor:
-        return normalized_input * self.input_std + self.input_mean
+    def unnormalize(self, normalized_tensor: torch.Tensor) -> torch.Tensor:
+        """Unnormalizes a tensor using the global mean and std."""
+        # Ensure the tensor is the correct shape for unnormalization
+        return normalized_tensor * self.data_std.to(normalized_tensor.device) + self.data_mean.to(normalized_tensor.device)
 
     def __len__(self):
         return len(self.inputs)
 
     def __getitem__(self, idx):
-        return self.inputs[idx], self.targets[idx], self.single_simulation_masses
+        return self.inputs[idx], self.targets[idx], self.sample_masses[idx]
 
 # Visualization
 def plot_3body_state(ax, state_vector_np, masses_np, title="", colors=['r', 'g', 'b'], 
                      vel_arrow_color='k', grav_arrow_color='purple', arrow_scale=0.5, alpha=0.8, G=1.0):
+    """
+    Plots the positions, velocities, and gravitational forces of 3 bodies.
+    """
     states = state_vector_np.reshape(3, 4)
     positions = states[:, :2]
     velocities = states[:, 2:] 
@@ -183,24 +204,30 @@ def plot_3body_state(ax, state_vector_np, masses_np, title="", colors=['r', 'g',
     ax.set_title(title)
     ax.grid(True, linestyle='--', alpha=0.5)
 
+# --- Main execution block for testing and visualization ---
 if __name__ == "__main__":
     HISTORY_FRAMES = 2 
     DATA_FILENAME = "three_body_data.pt"
     VIS_PLOT_PATH = "dataset_visualization.png" 
 
     try:
-        dataset = ThreeBodyDataset(filename=DATA_FILENAME, history_frames=HISTORY_FRAMES)
+        # The dataset will automatically generate data if it's missing
+        dataset = ThreeBodyDataset(filename=DATA_FILENAME, history_frames=HISTORY_FRAMES, num_sims_to_use=1)
     except ValueError as e:
         print(e)
         sys.exit(1) 
     
     print("\nStarting dataset visualization...")
+    # Get the first sample from the dataset
     x_sample_norm, y_sample_norm, masses_sample = dataset[0] 
 
+    # The input `x_sample_norm` is a flattened tensor of `history_frames * 12` features.
+    # The last 12 features correspond to the current state at time 't'.
     current_state_t_norm = x_sample_norm[-12:] 
-    current_state_t_unnorm = dataset.unnormalize_output(current_state_t_norm.cpu()).numpy()
+    current_state_t_unnorm = dataset.unnormalize(current_state_t_norm).numpy()
 
-    gt_next_state_unnorm = dataset.unnormalize_output(y_sample_norm.cpu()).numpy()
+    # The target `y_sample_norm` is the state at time 't+1'.
+    gt_next_state_unnorm = dataset.unnormalize(y_sample_norm).numpy()
 
     fig_vis, axs_vis = plt.subplots(1, 2, figsize=(12, 6), sharex=True, sharey=True)
     fig_vis.suptitle("3-Body Dataset Visualization (Sample 0)", fontsize=16)
@@ -211,7 +238,6 @@ if __name__ == "__main__":
     plot_3body_state(axs_vis[1], gt_next_state_unnorm, masses_sample.numpy(), 
                      title="Ground Truth Next State (Time t+1)", vel_arrow_color='k', grav_arrow_color='purple')
 
-    from matplotlib.lines import Line2D
     legend_elements = [
         Line2D([0], [0], marker='o', color='r', label='Body 1 Position', markersize=8),
         Line2D([0], [0], marker='o', color='g', label='Body 2 Position', markersize=8),
@@ -221,9 +247,7 @@ if __name__ == "__main__":
     ]
     fig_vis.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(1.0, 0.95))
 
-
     plt.tight_layout(rect=[0, 0.03, 1, 0.95]) 
     plt.savefig(VIS_PLOT_PATH, dpi=300, bbox_inches='tight')
     plt.show()
     print(f"Dataset visualization plot saved to {VIS_PLOT_PATH}")
-

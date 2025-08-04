@@ -6,10 +6,18 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 import sys
-from data import ThreeBodyDataset
+from matplotlib.lines import Line2D
+from data import ThreeBodyDataset # Importing the dataset class from a separate data.py file
 
-# CNN
+# ==============================================================================
+# --- CNN Model Definition ---
+# ==============================================================================
+
 class CNN(nn.Module):
+    """
+    A simple Convolutional Neural Network for predicting the next state
+    of a 3-body system.
+    """
     def __init__(self, input_features, output_features, hidden_channels=64, kernel_size=3):
         super().__init__()
         self.input_features = input_features
@@ -19,8 +27,12 @@ class CNN(nn.Module):
 
         padding = (kernel_size - 1) // 2
 
+        # The input is a flattened vector (batch_size, history_frames * 12).
+        # We need to reshape it for the Conv1D layers.
+        # This lifting conv reshapes it to (batch_size, channels, features)
         self.lifting_conv = nn.Conv1d(1, hidden_channels, 1)
 
+        # CNN blocks with residual connections
         self.conv_block1 = nn.Sequential(
             nn.Conv1d(hidden_channels, hidden_channels, kernel_size, padding=padding),
             nn.ReLU(),
@@ -35,59 +47,166 @@ class CNN(nn.Module):
         )
         self.skip_conv2 = nn.Conv1d(hidden_channels, hidden_channels, 1)
 
+        # Final projection layers
+        # The input to the FC layers is flattened after pooling
         self.fc1 = nn.Linear(hidden_channels, 128)
         self.fc2 = nn.Linear(128, output_features)
         
         self.dropout = nn.Dropout(0.1)
 
     def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, history_frames * 12)
+        """
         original_shape = x.shape
         
+        # Handle single sample case
         if x.dim() == 1:
             x = x.unsqueeze(0)
-
+            
+        # Reshape for Conv1D: (batch_size, channels, sequence_length)
+        # Here, channels=1 and sequence_length is the flattened state vector
         x = x.unsqueeze(1) 
         
+        # Lifting layer to embed the input features into the channel space
         x = F.relu(self.lifting_conv(x))
 
+        # First CNN block with residual connection
         res = x 
         x = self.conv_block1(x)
         x = F.relu(x + self.skip_conv1(res)) 
         x = self.dropout(x)
 
+        # Second CNN block with residual connection
         res = x
         x = self.conv_block2(x)
         x = F.relu(x + self.skip_conv2(res))
         x = self.dropout(x)
         
+        # Global Average Pooling to reduce the sequence dimension
         x = F.adaptive_avg_pool1d(x, 1)
         x = x.squeeze(-1) 
 
+        # Final projection layers
         x = F.relu(self.fc1(x))
         x = self.dropout(x)
         x = self.fc2(x)
 
+        # Return to original shape if input was a single sample
         if len(original_shape) == 1:
             x = x.squeeze(0)
             
         return x
 
-# Training
+# ==============================================================================
+# --- Helper Functions for Evaluation and Plotting ---
+# ==============================================================================
+
+def calculate_center_of_mass(states, masses):
+    """
+    Calculates the center of mass for a set of three-body states.
+    Args:
+        states (torch.Tensor): Tensor of shape [num_steps, 12] containing state vectors.
+        masses (torch.Tensor): Tensor of shape [3] with body masses.
+    Returns:
+        torch.Tensor: Tensor of shape [num_steps, 2] with the COM positions.
+    """
+    # Reshape states to [num_steps, 3 bodies, 4 features (x, y, vx, vy)]
+    positions = states.view(-1, 3, 4)[..., :2]
+    total_mass = masses.sum()
+    # Expand masses to [1, 3, 1] for broadcasting
+    weighted_positions = positions * masses.view(1, 3, 1)
+    com_positions = weighted_positions.sum(dim=1) / total_mass
+    return com_positions
 
 
+def plot_trajectory(predicted_traj, ground_truth_traj, num_steps, plot_path):
+    """
+    Plots the predicted and ground truth 2D trajectories of the three bodies.
+    """
+    plt.figure(figsize=(10, 8))
+    
+    # Reshape trajectories to [steps, bodies, features] and move to CPU for plotting
+    pred_pos = predicted_traj.cpu().view(-1, 3, 4).numpy()
+    gt_pos = ground_truth_traj.cpu().view(-1, 3, 4).numpy()
+    
+    colors = ['r', 'g', 'b']
+    labels = ['Body 1', 'Body 2', 'Body 3']
+    
+    # Plot predicted trajectories
+    for i in range(3):
+        plt.plot(pred_pos[:, i, 0], pred_pos[:, i, 1], '--', color=colors[i], label=f'Predicted {labels[i]}')
+        
+    # Plot ground truth trajectories
+    for i in range(3):
+        plt.plot(gt_pos[:, i, 0], gt_pos[:, i, 1], '-', color=colors[i], label=f'Ground Truth {labels[i]}')
+        
+    plt.title(f"CNN Predicted vs. Ground Truth Trajectory (Steps 1 to {num_steps})")
+    plt.xlabel("X Position")
+    plt.ylabel("Y Position")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.show()
+    print(f"Trajectory plot saved to {plot_path}")
+
+
+def plot_com_trajectory(predicted_com, ground_truth_com, plot_path):
+    """
+    Plots the center of mass trajectory for predictions and ground truth.
+    """
+    plt.figure(figsize=(10, 8))
+    
+    # Move tensors to CPU and convert to numpy for plotting
+    predicted_com_np = predicted_com.cpu().numpy()
+    ground_truth_com_np = ground_truth_com.cpu().numpy()
+
+    plt.plot(predicted_com_np[:, 0], predicted_com_np[:, 1], 'ro-', label='Predicted COM')
+    plt.plot(ground_truth_com_np[:, 0], ground_truth_com_np[:, 1], 'bo-', label='Ground Truth COM')
+    
+    plt.title("CNN Center of Mass Trajectory")
+    plt.xlabel("X Position of COM")
+    plt.ylabel("Y Position of COM")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.show()
+    print(f"Center of mass plot saved to {plot_path}")
+
+
+# ==============================================================================
+# --- Training Configuration and Main Execution ---
+# ==============================================================================
+
+# --- Training Configuration ---
 HISTORY_FRAMES = 2 
-BATCH_SIZE = 64    
-NUM_EPOCHS = 500   
+BATCH_SIZE = 64 
+NUM_EPOCHS = 500
 LEARNING_RATE = 1e-3
+NUM_PREDICTION_STEPS = 10
+# Change this variable to switch between 10, 100, and 1000 simulations
+NUM_SIMULATIONS_TO_USE = 100 
 
+# ==============================================================================
+# --- DYNAMIC FILE NAMING ---
+# File paths are now dynamically generated based on NUM_SIMULATIONS_TO_USE
+# This prevents overwriting files for different simulation counts.
+# ==============================================================================
 MODEL_NAME = "CNN"
-CHECKPOINT_PATH = f"{MODEL_NAME.lower()}_3body_checkpoint.pth"
-FINAL_MODEL_PATH = f"{MODEL_NAME.lower()}_3body_final.pth"
-LOSS_PLOT_PATH = f"{MODEL_NAME.lower()}_training_loss.png"
-EVAL_PLOT_PATH = f"{MODEL_NAME.lower()}_evaluation_plot.png"
+DATA_FILENAME = f"three_body_data.pt"
+CHECKPOINT_PATH = f"{MODEL_NAME.lower()}_3body_checkpoint_{NUM_SIMULATIONS_TO_USE}_sims.pth"
+FINAL_MODEL_PATH = f"{MODEL_NAME.lower()}_3body_final_{NUM_SIMULATIONS_TO_USE}_sims.pth"
+LOSS_PLOT_PATH = f"{MODEL_NAME.lower()}_training_loss_{NUM_SIMULATIONS_TO_USE}_sims.png"
+TRAJECTORY_PLOT_PATH = f"{MODEL_NAME.lower()}_trajectory_comparison_{NUM_SIMULATIONS_TO_USE}_sims.png"
+COM_PLOT_PATH = f"{MODEL_NAME.lower()}_com_comparison_{NUM_SIMULATIONS_TO_USE}_sims.png"
 
+
+# --- Device Setup ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Training {MODEL_NAME} on device: {device}")
+print(f"Training {MODEL_NAME} with {NUM_SIMULATIONS_TO_USE} simulations on device: {device}")
 
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
@@ -95,13 +214,19 @@ if torch.cuda.is_available():
 else:
     print("CUDA not available, using CPU")
 
-dataset = ThreeBodyDataset(filename="three_body_data.pt", history_frames=HISTORY_FRAMES)
-loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+# --- Load data ---
+try:
+    dataset = ThreeBodyDataset(filename=DATA_FILENAME, history_frames=HISTORY_FRAMES, num_sims_to_use=NUM_SIMULATIONS_TO_USE)
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+except ValueError as e:
+    print(e)
+    sys.exit(1)
 
+# --- Model Initialization ---
 INPUT_FEATURES = HISTORY_FRAMES * 12
 OUTPUT_FEATURES = 12
 
-model = CNN(input_features=INPUT_FEATURES, output_features=OUTPUT_FEATURES, hidden_channels=64, kernel_size=3).to(device)
+model = CNN(input_features=INPUT_FEATURES, output_features=OUTPUT_FEATURES).to(device)
 
 print(f"Model {MODEL_NAME} initialized with {sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable parameters.")
 
@@ -112,12 +237,14 @@ start_epoch = 0
 loss_history = []
 best_loss = float('inf')
 
+# --- Resume from Checkpoint ---
 if os.path.exists(CHECKPOINT_PATH):
     try:
-        checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+        checkpoint = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
         
         if "model_state_dict" in checkpoint:
-            model.load_state_dict(checkpoint["model_state_dict"])
+            # Use strict=False here if the model architecture has changed significantly
+            model.load_state_dict(checkpoint["model_state_dict"], strict=False)
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             start_epoch = checkpoint["epoch"] + 1
             loss_history = checkpoint.get("loss_history", [])
@@ -132,13 +259,15 @@ if os.path.exists(CHECKPOINT_PATH):
         if os.path.exists(CHECKPOINT_PATH):
             os.remove(CHECKPOINT_PATH)
 
+
+# --- Training Loop ---
 model.train()
 print(f"\nStarting {MODEL_NAME} training...")
 for epoch in range(start_epoch, NUM_EPOCHS):
     total_loss = 0
     num_batches = 0
     
-    for x, y in loader:
+    for x, y, _ in loader:
         x, y = x.to(device), y.to(device)
         
         pred = model(x)
@@ -183,9 +312,10 @@ torch.save({
 }, FINAL_MODEL_PATH)
 print(f"Final {MODEL_NAME} model saved to {FINAL_MODEL_PATH}")
 
+# Plot training loss
 plt.figure(figsize=(10, 6))
 plt.plot(loss_history, 'b-', linewidth=2)
-plt.title(f"{MODEL_NAME} Training Loss Over Epochs")
+plt.title(f"{MODEL_NAME} Training Loss Over Epochs for {NUM_SIMULATIONS_TO_USE} Sims")
 plt.xlabel("Epoch")
 plt.ylabel("Loss")
 plt.grid(True, alpha=0.3)
@@ -194,3 +324,80 @@ plt.tight_layout()
 plt.savefig(LOSS_PLOT_PATH, dpi=300, bbox_inches='tight')
 plt.show()
 print(f"Training loss plot saved to {LOSS_PLOT_PATH}")
+
+
+# --- Evaluation and Plotting ---
+print("\n" + "="*50)
+print("Starting evaluation and plotting tasks...")
+
+# Load the trained model and set to evaluation mode
+model_state = torch.load(FINAL_MODEL_PATH, map_location=device, weights_only=False)
+model.load_state_dict(model_state["model_state_dict"], strict=False)
+model.eval()
+
+# Get a single initial sample from the data (e.g., the 100th data point)
+start_index = 100
+if start_index + NUM_PREDICTION_STEPS + HISTORY_FRAMES >= len(dataset):
+    start_index = len(dataset) - NUM_PREDICTION_STEPS - HISTORY_FRAMES - 1
+
+start_x_norm, _, start_masses = dataset[start_index]
+
+# Create the ground truth trajectory by unnormalizing the data
+ground_truth_full_traj = []
+for i in range(HISTORY_FRAMES + NUM_PREDICTION_STEPS):
+    # This logic ensures we get the correct state frame, whether it's from
+    # the initial history or a future step.
+    if i < HISTORY_FRAMES:
+        _, _, _ = dataset[start_index + i]
+        # Get the i-th frame from the input history
+        frame_norm = start_x_norm.view(HISTORY_FRAMES, 12)[i]
+    else:
+        # Get the target for the future step
+        _, target_norm, _ = dataset[start_index + i]
+        frame_norm = target_norm
+    
+    ground_truth_full_traj.append(dataset.unnormalize(frame_norm.to(device)))
+ground_truth_full_traj = torch.stack(ground_truth_full_traj)
+
+print(f"Model loaded successfully. Starting {NUM_PREDICTION_STEPS}-step prediction.")
+
+# Perform multi-step prediction
+with torch.no_grad():
+    current_input_norm = start_x_norm.unsqueeze(0).to(device)
+    predicted_sequence_norm = []
+    
+    for _ in range(NUM_PREDICTION_STEPS):
+        # Make a prediction for the next step (in normalized space)
+        predicted_next_step_norm = model(current_input_norm)
+        predicted_sequence_norm.append(predicted_next_step_norm.squeeze(0))
+        
+        # Prepare the input for the next step by "rolling" the history
+        new_input_history_norm = torch.cat([
+            current_input_norm.squeeze(0)[12:].unsqueeze(0), 
+            predicted_next_step_norm
+        ], dim=1)
+        
+        current_input_norm = new_input_history_norm
+        
+predicted_sequence_norm = torch.stack(predicted_sequence_norm)
+
+# Combine the unnormalized history with the predicted sequence to form the full trajectory
+start_history_states_unnorm = dataset.unnormalize(start_x_norm).view(HISTORY_FRAMES, 12).to(device)
+predicted_sequence_unnorm = dataset.unnormalize(predicted_sequence_norm)
+predicted_full_traj = torch.cat([start_history_states_unnorm, predicted_sequence_unnorm], dim=0)
+
+print("Multi-step prediction complete.")
+
+# Plot the trajectories
+plot_trajectory(predicted_full_traj, ground_truth_full_traj, NUM_PREDICTION_STEPS, TRAJECTORY_PLOT_PATH)
+
+# Calculate and plot the Center of Mass (COM)
+masses = start_masses.to(device)
+
+predicted_com = calculate_center_of_mass(predicted_full_traj, masses)
+ground_truth_com = calculate_center_of_mass(ground_truth_full_traj, masses)
+
+plot_com_trajectory(predicted_com, ground_truth_com, COM_PLOT_PATH)
+
+print("Evaluation script finished.")
+print("="*50)
