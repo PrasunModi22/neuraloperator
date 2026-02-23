@@ -87,12 +87,14 @@ class ThreeBodyDataset(Dataset):
     PyTorch Dataset for 3-body simulation data.
     This version implements a single, global normalization across the entire dataset.
     """
-    def __init__(self, filename="three_body_data.pt", history_frames=2, num_sims_to_use=10):
+    def __init__(self, filename="three_body_data.pt", history_frames=4, future_frames=5, num_sims_to_use=10):
         if not os.path.exists(filename):
             print(f"Data file '{filename}' not found. Generating data...")
             generate_and_save_data(filename=filename)
 
         self.history_frames = history_frames
+        self.future_frames = future_frames
+
         
         loaded_content = torch.load(filename) 
         if not isinstance(loaded_content, dict) or 'data' not in loaded_content or 'masses' not in loaded_content:
@@ -118,14 +120,12 @@ class ThreeBodyDataset(Dataset):
         for sim_idx in range(len(self.normalized_data)):
             sim_data = self.normalized_data[sim_idx]
             sim_masses = self.raw_masses[sim_idx]
-            for t in range(self.history_frames - 1, len(sim_data) - 1):
+            for t in range(self.history_frames - 1, len(sim_data) - self.future_frames):
                 input_sequence = sim_data[t - self.history_frames + 1 : t + 1]
                 self.inputs.append(input_sequence.reshape(-1))
 
-                target_frame = sim_data[t + 1]
-                self.targets.append(target_frame.reshape(-1))
-                
-                self.sample_masses.append(sim_masses)
+                future_sequence = sim_data[t + 1 : t + 1 + self.future_frames]
+                self.targets.append(future_sequence.reshape(-1))
 
         self.inputs = torch.stack(self.inputs) 
         self.targets = torch.stack(self.targets) 
